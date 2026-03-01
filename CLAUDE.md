@@ -84,6 +84,30 @@ Delete a task: `node .../dist/schedule-cli.js delete <id>`
 Pause a task: `node .../dist/schedule-cli.js pause <id>`
 Resume a task: `node .../dist/schedule-cli.js resume <id>`
 
+## Sending Files via Telegram
+
+When [YOUR NAME] asks you to create a file and send it to them (PDF, spreadsheet, image, etc.), include a file marker in your response. The bot will parse these markers and send the files as Telegram attachments.
+
+**Syntax:**
+- `[SEND_FILE:/absolute/path/to/file.pdf]` — sends as a document attachment
+- `[SEND_PHOTO:/absolute/path/to/image.png]` — sends as an inline photo
+- `[SEND_FILE:/absolute/path/to/file.pdf|Optional caption here]` — with a caption
+
+**Rules:**
+- Always use absolute paths
+- Create the file first (using Write tool, a skill, or Bash), then include the marker
+- Place markers on their own line when possible
+- You can include multiple markers to send multiple files
+- The marker text gets stripped from the message — write your normal response text around it
+- Max file size: 50MB (Telegram limit)
+
+**Example response:**
+```
+Here's the quarterly report.
+[SEND_FILE:/tmp/q1-report.pdf|Q1 2026 Report]
+Let me know if you need any changes.
+```
+
 ## Message Format
 
 - Messages come via Telegram — keep responses tight and readable

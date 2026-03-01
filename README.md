@@ -352,6 +352,18 @@ Any file Claude Code can open: PDFs, code, markdown, CSV, plain text. Caption is
 
 ClaudeClaw downloads the video to `workspace/uploads/` and tells Claude to analyze it with the `gemini-api-dev` skill. Without `GOOGLE_API_KEY`, Claude receives the file path but can't understand the content. Telegram caps downloads at 20MB.
 
+### File sending → Claude sends you files
+
+Ask Claude to create a file (PDF, spreadsheet, image, text) and send it to you. Claude creates the file on your machine, includes a `[SEND_FILE:/path]` marker in its response, and the bot sends it as a Telegram attachment. Works with any file type up to 50MB.
+
+```
+"Write a haiku about AI and send it to me as a text file"
+"Create a PDF summary of my meeting notes and send it"
+"Generate a chart of monthly revenue and send the image"
+```
+
+Claude can also send photos inline using `[SEND_PHOTO:/path]`, and attach captions via `[SEND_FILE:/path|caption text]`. Multiple files in a single response are sent in order. If a file doesn't exist, you get an error message instead of a crash.
+
 ### Sessions persist
 
 Claude Code sessions carry full context across messages. Reference something from earlier — Claude knows. Send `/newchat` to start fresh.

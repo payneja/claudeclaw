@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
 
 import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
@@ -201,6 +202,44 @@ export function splitMessage(text: string): string[] {
   return parts;
 }
 
+// ── File marker types ─────────────────────────────────────────────────
+export interface FileMarker {
+  type: 'document' | 'photo';
+  filePath: string;
+  caption?: string;
+}
+
+export interface ExtractResult {
+  text: string;
+  files: FileMarker[];
+}
+
+/**
+ * Extract [SEND_FILE:path] and [SEND_PHOTO:path] markers from Claude's response.
+ * Supports optional captions via pipe: [SEND_FILE:/path/to/file.pdf|Here's your report]
+ *
+ * Returns the cleaned text (markers stripped) and an array of file descriptors.
+ */
+export function extractFileMarkers(text: string): ExtractResult {
+  const files: FileMarker[] = [];
+
+  const pattern = /\[SEND_(FILE|PHOTO):([^\]\|]+)(?:\|([^\]]*))?\]/g;
+
+  const cleaned = text.replace(pattern, (_, kind: string, filePath: string, caption?: string) => {
+    files.push({
+      type: kind === 'PHOTO' ? 'photo' : 'document',
+      filePath: filePath.trim(),
+      caption: caption?.trim() || undefined,
+    });
+    return '';
+  });
+
+  // Collapse extra blank lines left by stripped markers
+  const trimmed = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+
+  return { text: trimmed, files };
+}
+
 /**
  * Send a Telegram typing action. Silently ignores errors (e.g. bot was blocked).
  */
@@ -290,12 +329,34 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       logger.info({ newSessionId: result.newSessionId }, 'Session saved');
     }
 
-    const responseText = result.text?.trim() || 'Done.';
+    const rawResponse = result.text?.trim() || 'Done.';
+
+    // Extract file markers before any formatting
+    const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
 
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
     if (!skipLog) {
-      saveConversationTurn(chatIdStr, message, responseText, result.newSessionId ?? sessionId);
+      saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId);
+    }
+
+    // Send any attached files first
+    for (const file of fileMarkers) {
+      try {
+        if (!fs.existsSync(file.filePath)) {
+          await ctx.reply(`Could not send file: ${file.filePath} (not found)`);
+          continue;
+        }
+        const input = new InputFile(file.filePath);
+        if (file.type === 'photo') {
+          await ctx.replyWithPhoto(input, file.caption ? { caption: file.caption } : undefined);
+        } else {
+          await ctx.replyWithDocument(input, file.caption ? { caption: file.caption } : undefined);
+        }
+      } catch (fileErr) {
+        logger.error({ err: fileErr, filePath: file.filePath }, 'Failed to send file via Telegram');
+        await ctx.reply(`Failed to send file: ${file.filePath}`);
+      }
     }
 
     // Voice response: send audio if user sent a voice note (forceVoiceReply)
@@ -303,19 +364,22 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const caps = voiceCapabilities();
     const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
-    if (shouldSpeakBack) {
-      try {
-        const audioBuffer = await synthesizeSpeech(responseText);
-        await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.mp3'));
-      } catch (ttsErr) {
-        logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
+    // Send text response (if there's any left after stripping markers)
+    if (responseText) {
+      if (shouldSpeakBack) {
+        try {
+          const audioBuffer = await synthesizeSpeech(responseText);
+          await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.mp3'));
+        } catch (ttsErr) {
+          logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
+          for (const part of splitMessage(formatForTelegram(responseText))) {
+            await ctx.reply(part, { parse_mode: 'HTML' });
+          }
+        }
+      } else {
         for (const part of splitMessage(formatForTelegram(responseText))) {
           await ctx.reply(part, { parse_mode: 'HTML' });
         }
-      }
-    } else {
-      for (const part of splitMessage(formatForTelegram(responseText))) {
-        await ctx.reply(part, { parse_mode: 'HTML' });
       }
     }
 
