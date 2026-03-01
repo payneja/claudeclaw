@@ -5,6 +5,9 @@ import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
 import {
   ALLOWED_CHAT_ID,
   CONTEXT_LIMIT,
+  DASHBOARD_PORT,
+  DASHBOARD_TOKEN,
+  DASHBOARD_URL,
   MAX_MESSAGE_LENGTH,
   TELEGRAM_BOT_TOKEN,
   TYPING_REFRESH_MS,
@@ -590,8 +593,21 @@ export function createBot(): Bot {
     }
   });
 
+  // /dashboard — send a clickable link to the web dashboard
+  bot.command('dashboard', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (!DASHBOARD_TOKEN) {
+      await ctx.reply('Dashboard not configured. Set DASHBOARD_TOKEN in .env and restart.');
+      return;
+    }
+    const chatIdStr = ctx.chat!.id.toString();
+    const base = DASHBOARD_URL || `http://localhost:${DASHBOARD_PORT}`;
+    const url = `${base}/?token=${DASHBOARD_TOKEN}&chatId=${chatIdStr}`;
+    await ctx.reply(`<a href="${url}">Open Dashboard</a>`, { parse_mode: 'HTML' });
+  });
+
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/memory', '/forget', '/chatid', '/wa', '/slack']);
+  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();

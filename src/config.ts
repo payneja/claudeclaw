@@ -12,6 +12,9 @@ const envConfig = readEnvFile([
   'WHATSAPP_ENABLED',
   'SLACK_USER_TOKEN',
   'CONTEXT_LIMIT',
+  'DASHBOARD_PORT',
+  'DASHBOARD_TOKEN',
+  'DASHBOARD_URL',
 ]);
 
 export const TELEGRAM_BOT_TOKEN =
@@ -54,3 +57,13 @@ export const CONTEXT_LIMIT = parseInt(
   process.env.CONTEXT_LIMIT || envConfig.CONTEXT_LIMIT || '1000000',
   10,
 );
+
+// Dashboard — web UI for monitoring ClaudeClaw state
+export const DASHBOARD_PORT = parseInt(
+  process.env.DASHBOARD_PORT || envConfig.DASHBOARD_PORT || '3141',
+  10,
+);
+export const DASHBOARD_TOKEN =
+  process.env.DASHBOARD_TOKEN || envConfig.DASHBOARD_TOKEN || '';
+export const DASHBOARD_URL =
+  process.env.DASHBOARD_URL || envConfig.DASHBOARD_URL || '';

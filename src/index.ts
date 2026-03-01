@@ -3,6 +3,7 @@ import path from 'path';
 
 import { createBot } from './bot.js';
 import { ALLOWED_CHAT_ID, TELEGRAM_BOT_TOKEN, STORE_DIR, PROJECT_ROOT } from './config.js';
+import { startDashboard } from './dashboard.js';
 import { initDatabase } from './db.js';
 import { logger } from './logger.js';
 import { cleanupOldUploads } from './media.js';
@@ -53,6 +54,8 @@ async function main(): Promise<void> {
 
   initDatabase();
   logger.info('Database ready');
+
+  startDashboard();
 
   runDecaySweep();
   setInterval(() => runDecaySweep(), 24 * 60 * 60 * 1000);

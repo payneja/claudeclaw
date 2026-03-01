@@ -519,6 +519,172 @@ export interface SessionTokenSummary {
   lastTurnAt: number;
 }
 
+// ── Dashboard Queries ──────────────────────────────────────────────────
+
+export interface DashboardMemoryStats {
+  total: number;
+  semantic: number;
+  episodic: number;
+  avgSalience: number;
+  salienceDistribution: { bucket: string; count: number }[];
+}
+
+export function getDashboardMemoryStats(chatId: string): DashboardMemoryStats {
+  const counts = db
+    .prepare(
+      `SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN sector = 'semantic' THEN 1 ELSE 0 END) as semantic,
+         SUM(CASE WHEN sector = 'episodic' THEN 1 ELSE 0 END) as episodic,
+         AVG(salience) as avgSalience
+       FROM memories WHERE chat_id = ?`,
+    )
+    .get(chatId) as { total: number; semantic: number; episodic: number; avgSalience: number | null };
+
+  const buckets = db
+    .prepare(
+      `SELECT
+         CASE
+           WHEN salience < 0.5 THEN '0-0.5'
+           WHEN salience < 1.0 THEN '0.5-1'
+           WHEN salience < 2.0 THEN '1-2'
+           WHEN salience < 3.0 THEN '2-3'
+           WHEN salience < 4.0 THEN '3-4'
+           ELSE '4-5'
+         END as bucket,
+         COUNT(*) as count
+       FROM memories WHERE chat_id = ?
+       GROUP BY bucket
+       ORDER BY bucket`,
+    )
+    .all(chatId) as { bucket: string; count: number }[];
+
+  return {
+    total: counts.total,
+    semantic: counts.semantic,
+    episodic: counts.episodic,
+    avgSalience: counts.avgSalience ?? 0,
+    salienceDistribution: buckets,
+  };
+}
+
+export function getDashboardLowSalienceMemories(chatId: string, limit = 10): Memory[] {
+  return db
+    .prepare(
+      `SELECT * FROM memories WHERE chat_id = ? AND salience < 0.5
+       ORDER BY salience ASC LIMIT ?`,
+    )
+    .all(chatId, limit) as Memory[];
+}
+
+export function getDashboardTopAccessedMemories(chatId: string, limit = 5): Memory[] {
+  return db
+    .prepare(
+      `SELECT * FROM memories WHERE chat_id = ?
+       ORDER BY salience DESC LIMIT ?`,
+    )
+    .all(chatId, limit) as Memory[];
+}
+
+export function getDashboardMemoryTimeline(chatId: string, days = 30): { date: string; semantic: number; episodic: number }[] {
+  return db
+    .prepare(
+      `SELECT
+         date(created_at, 'unixepoch') as date,
+         SUM(CASE WHEN sector = 'semantic' THEN 1 ELSE 0 END) as semantic,
+         SUM(CASE WHEN sector = 'episodic' THEN 1 ELSE 0 END) as episodic
+       FROM memories
+       WHERE chat_id = ? AND created_at >= unixepoch('now', ?)
+       GROUP BY date
+       ORDER BY date`,
+    )
+    .all(chatId, `-${days} days`) as { date: string; semantic: number; episodic: number }[];
+}
+
+export interface DashboardTokenStats {
+  todayInput: number;
+  todayOutput: number;
+  todayCost: number;
+  todayTurns: number;
+  allTimeCost: number;
+  allTimeTurns: number;
+}
+
+export function getDashboardTokenStats(chatId: string): DashboardTokenStats {
+  const today = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(input_tokens), 0) as todayInput,
+         COALESCE(SUM(output_tokens), 0) as todayOutput,
+         COALESCE(SUM(cost_usd), 0) as todayCost,
+         COUNT(*) as todayTurns
+       FROM token_usage
+       WHERE chat_id = ? AND created_at >= unixepoch('now', 'start of day')`,
+    )
+    .get(chatId) as { todayInput: number; todayOutput: number; todayCost: number; todayTurns: number };
+
+  const allTime = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(cost_usd), 0) as allTimeCost,
+         COUNT(*) as allTimeTurns
+       FROM token_usage WHERE chat_id = ?`,
+    )
+    .get(chatId) as { allTimeCost: number; allTimeTurns: number };
+
+  return { ...today, ...allTime };
+}
+
+export function getDashboardCostTimeline(chatId: string, days = 30): { date: string; cost: number; turns: number }[] {
+  return db
+    .prepare(
+      `SELECT
+         date(created_at, 'unixepoch') as date,
+         SUM(cost_usd) as cost,
+         COUNT(*) as turns
+       FROM token_usage
+       WHERE chat_id = ? AND created_at >= unixepoch('now', ?)
+       GROUP BY date
+       ORDER BY date`,
+    )
+    .all(chatId, `-${days} days`) as { date: string; cost: number; turns: number }[];
+}
+
+export interface RecentTokenUsageRow {
+  id: number;
+  chat_id: string;
+  session_id: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read: number;
+  context_tokens: number;
+  cost_usd: number;
+  did_compact: number;
+  created_at: number;
+}
+
+export function getDashboardRecentTokenUsage(chatId: string, limit = 20): RecentTokenUsageRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM token_usage WHERE chat_id = ?
+       ORDER BY created_at DESC LIMIT ?`,
+    )
+    .all(chatId, limit) as RecentTokenUsageRow[];
+}
+
+export function getDashboardMemoriesBySector(chatId: string, sector: string, limit = 50, offset = 0): { memories: Memory[]; total: number } {
+  const total = db
+    .prepare('SELECT COUNT(*) as cnt FROM memories WHERE chat_id = ? AND sector = ?')
+    .get(chatId, sector) as { cnt: number };
+  const memories = db
+    .prepare(
+      `SELECT * FROM memories WHERE chat_id = ? AND sector = ?
+       ORDER BY salience DESC, created_at DESC LIMIT ? OFFSET ?`,
+    )
+    .all(chatId, sector, limit, offset) as Memory[];
+  return { memories, total: total.cnt };
+}
+
 export function getSessionTokenUsage(sessionId: string): SessionTokenSummary | null {
   const row = db
     .prepare(
