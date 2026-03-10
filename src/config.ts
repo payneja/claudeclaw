@@ -40,6 +40,13 @@ const __dirname = path.dirname(__filename);
 export const PROJECT_ROOT = path.resolve(__dirname, '..');
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 
+// Context window limit for the active model (tokens).
+// Sonnet on Tier 2 API = 200k. Adjust if switching to Opus 1M.
+export const CONTEXT_LIMIT = parseInt(
+  process.env.CONTEXT_LIMIT || '200000',
+  10,
+);
+
 // Telegram limits
 export const MAX_MESSAGE_LENGTH = 4096;
 

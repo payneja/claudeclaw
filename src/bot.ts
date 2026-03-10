@@ -1,39 +1,59 @@
+import fs from 'fs';
 import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
 
 import { runAgent, UsageInfo } from './agent.js';
 import {
   ALLOWED_CHAT_ID,
+  CONTEXT_LIMIT,
   MAX_MESSAGE_LENGTH,
   TELEGRAM_BOT_TOKEN,
   TYPING_REFRESH_MS,
 } from './config.js';
+import { setActiveAbort, abortActiveQuery } from './state.js';
 import { clearSession, getRecentConversation, getRecentMemories, getSession, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, saveConversationTurn } from './memory.js';
 
 // ── Context window tracking ──────────────────────────────────────────
-// Track the last known input_tokens per chat so we can warn proactively.
-// Claude Code's context window is ~200k tokens. Warn at 75%.
-const CONTEXT_WARN_THRESHOLD = 150_000;
+// Uses input_tokens from the last API call (= actual context window size:
+// system prompt + conversation history + tool results for that call).
+// Tracks baseline per session so warnings reflect conversation growth,
+// not fixed overhead (system prompt, skills, CLAUDE.md, MCP tools).
+const CONTEXT_WARN_PCT = 0.75;
 const lastUsage = new Map<string, UsageInfo>();
+const sessionBaseline = new Map<string, number>();
 
 /**
  * Check if context usage is getting high and return a warning string, or null.
+ * Uses lastCallInputTokens (total context) for accurate measurement.
  */
-function checkContextWarning(chatId: string, usage: UsageInfo): string | null {
+function checkContextWarning(chatId: string, sessionId: string | undefined, usage: UsageInfo): string | null {
   lastUsage.set(chatId, usage);
 
   if (usage.didCompact) {
     return '⚠️ Context window was auto-compacted this turn. Some earlier conversation may have been summarized. Consider /newchat + /respin if things feel off.';
   }
 
-  // Use the last single API call's cache read — this reflects actual context size.
-  // The cumulative cacheReadInputTokens overcounts on multi-step tool-use turns
-  // (each step re-reads the full cache, so 3 steps = 3x the real size).
-  if (usage.lastCallCacheRead > CONTEXT_WARN_THRESHOLD) {
-    const pct = Math.round((usage.lastCallCacheRead / 200_000) * 100);
-    return `⚠️ Context window at ~${pct}%. Getting close to the limit. Consider /newchat + /respin soon to avoid a crash.`;
+  const contextTokens = usage.lastCallInputTokens;
+  if (contextTokens <= 0) return null;
+
+  // Record baseline on first turn of session (system prompt overhead)
+  const baseKey = sessionId ?? chatId;
+  if (!sessionBaseline.has(baseKey)) {
+    sessionBaseline.set(baseKey, contextTokens);
+    return null;
+  }
+
+  const baseline = sessionBaseline.get(baseKey)!;
+  const available = CONTEXT_LIMIT - baseline;
+  if (available <= 0) return null;
+
+  const conversationTokens = contextTokens - baseline;
+  const pct = Math.round((conversationTokens / available) * 100);
+
+  if (pct >= Math.round(CONTEXT_WARN_PCT * 100)) {
+    return `⚠️ Context window at ~${pct}% of available space (~${Math.round(conversationTokens / 1000)}k / ${Math.round(available / 1000)}k conversation tokens). Consider /newchat + /respin soon.`;
   }
 
   return null;
@@ -50,6 +70,49 @@ import { getWaChats, getWaChatMessages, sendWhatsAppMessage, WaChat } from './wh
 
 // Per-chat voice mode toggle (in-memory, resets on restart)
 const voiceEnabledChats = new Set<string>();
+
+// Per-chat model override (in-memory, resets on restart)
+// When not set, uses default from agent.ts ('sonnet')
+const chatModelOverride = new Map<string, string>();
+
+const AVAILABLE_MODELS = ['opus', 'sonnet', 'haiku'] as const;
+const DEFAULT_MODEL_LABEL = 'sonnet';
+
+// ── File sending markers ─────────────────────────────────────────────
+
+interface FileMarker {
+  type: 'photo' | 'document';
+  filePath: string;
+  caption?: string;
+}
+
+interface ExtractResult {
+  text: string;
+  files: FileMarker[];
+}
+
+/**
+ * Extract [SEND_FILE:path] and [SEND_PHOTO:path] markers from Claude's response.
+ * Supports optional captions via pipe: [SEND_FILE:/path/to/file.pdf|Here's your report]
+ */
+export function extractFileMarkers(text: string): ExtractResult {
+  const files: FileMarker[] = [];
+
+  const pattern = /\[SEND_(FILE|PHOTO):([^\]\|]+)(?:\|([^\]]*))?\]/g;
+
+  const cleaned = text.replace(pattern, (_, kind: string, filePath: string, caption?: string) => {
+    files.push({
+      type: kind === 'PHOTO' ? 'photo' : 'document',
+      filePath: filePath.trim(),
+      caption: caption?.trim() || undefined,
+    });
+    return '';
+  });
+
+  const trimmed = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+
+  return { text: trimmed, files };
+}
 
 // WhatsApp state per Telegram chat
 interface WaStateList { mode: 'list'; chats: WaChat[] }
@@ -244,24 +307,60 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     TYPING_REFRESH_MS,
   );
 
+  const abortCtrl = new AbortController();
+  setActiveAbort(chatIdStr, abortCtrl);
+
   try {
-    const result = await runAgent(fullMessage, sessionId, () =>
-      void sendTyping(ctx.api, chatId),
+    const result = await runAgent(
+      fullMessage,
+      sessionId,
+      () => void sendTyping(ctx.api, chatId),
+      chatModelOverride.get(chatIdStr),
+      abortCtrl,
     );
 
+    setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
+
+    // Handle abort
+    if (result.aborted) {
+      await ctx.reply('Stopped.');
+      return;
+    }
 
     if (result.newSessionId) {
       setSession(chatIdStr, result.newSessionId);
       logger.info({ newSessionId: result.newSessionId }, 'Session saved');
     }
 
-    const responseText = result.text?.trim() || 'Done.';
+    const rawResponse = result.text?.trim() || 'Done.';
+
+    // Extract file markers before formatting
+    const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
 
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
     if (!skipLog) {
-      saveConversationTurn(chatIdStr, message, responseText, result.newSessionId ?? sessionId);
+      saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId);
+    }
+
+    // Send any attached files first
+    for (const file of fileMarkers) {
+      try {
+        if (!fs.existsSync(file.filePath)) {
+          await ctx.reply(`Could not send file: ${file.filePath} (not found)`);
+          continue;
+        }
+        const input = new InputFile(file.filePath);
+        if (file.type === 'photo') {
+          await ctx.replyWithPhoto(input, file.caption ? { caption: file.caption } : undefined);
+        } else {
+          await ctx.replyWithDocument(input, file.caption ? { caption: file.caption } : undefined);
+        }
+      } catch (fileErr) {
+        logger.error({ err: fileErr, filePath: file.filePath }, 'Failed to send file via Telegram');
+        await ctx.reply(`Failed to send file: ${file.filePath}`);
+      }
     }
 
     // Voice response: send audio if user sent a voice note (forceVoiceReply)
@@ -269,19 +368,21 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const caps = voiceCapabilities();
     const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
-    if (shouldSpeakBack) {
-      try {
-        const audioBuffer = await synthesizeSpeech(responseText);
-        await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.mp3'));
-      } catch (ttsErr) {
-        logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
+    if (responseText) {
+      if (shouldSpeakBack) {
+        try {
+          const audioBuffer = await synthesizeSpeech(responseText);
+          await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.mp3'));
+        } catch (ttsErr) {
+          logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
+          for (const part of splitMessage(formatForTelegram(responseText))) {
+            await ctx.reply(part, { parse_mode: 'HTML' });
+          }
+        }
+      } else {
         for (const part of splitMessage(formatForTelegram(responseText))) {
           await ctx.reply(part, { parse_mode: 'HTML' });
         }
-      }
-    } else {
-      for (const part of splitMessage(formatForTelegram(responseText))) {
-        await ctx.reply(part, { parse_mode: 'HTML' });
       }
     }
 
@@ -294,16 +395,18 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
         result.usage.inputTokens,
         result.usage.outputTokens,
         result.usage.lastCallCacheRead,
+        result.usage.lastCallInputTokens,
         result.usage.totalCostUsd,
         result.usage.didCompact,
       );
 
-      const warning = checkContextWarning(chatIdStr, result.usage);
+      const warning = checkContextWarning(chatIdStr, activeSessionId, result.usage);
       if (warning) {
         await ctx.reply(warning);
       }
     }
   } catch (err) {
+    setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
     logger.error({ err }, 'Agent error');
 
@@ -312,7 +415,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     if (errMsg.includes('exited with code 1')) {
       const usage = lastUsage.get(chatIdStr);
       const hint = usage
-        ? `Last known context: ~${Math.round((usage.lastCallCacheRead / 1000))}k tokens.`
+        ? `Last known context: ~${Math.round((usage.lastCallInputTokens / 1000))}k tokens.`
         : 'No usage data from previous turns.';
       await ctx.reply(
         `Context window likely exhausted. ${hint}\n\nUse /newchat to start fresh, then /respin to pull recent conversation back in.`,
@@ -400,6 +503,46 @@ export function createBot(): Bot {
     } else {
       voiceEnabledChats.add(chatIdStr);
       await ctx.reply('Voice mode ON');
+    }
+  });
+
+  // /model — switch Claude model for this chat
+  bot.command('model', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    const arg = ctx.match?.trim().toLowerCase();
+
+    if (!arg) {
+      const current = chatModelOverride.get(chatIdStr) ?? DEFAULT_MODEL_LABEL + ' (default)';
+      const models = AVAILABLE_MODELS.join(', ');
+      await ctx.reply(`Current model: ${current}\nAvailable: ${models}\n\nUsage: /model haiku`);
+      return;
+    }
+
+    if (arg === 'reset' || arg === 'default' || arg === 'sonnet') {
+      chatModelOverride.delete(chatIdStr);
+      await ctx.reply('Model reset to default (sonnet)');
+      return;
+    }
+
+    if (!(AVAILABLE_MODELS as readonly string[]).includes(arg)) {
+      await ctx.reply(`Unknown model: ${arg}\nAvailable: ${AVAILABLE_MODELS.join(', ')}`);
+      return;
+    }
+
+    chatModelOverride.set(chatIdStr, arg);
+    await ctx.reply(`Model changed: ${arg}`);
+  });
+
+  // /abort — cancel the active query
+  bot.command('abort', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    const aborted = abortActiveQuery(chatIdStr);
+    if (aborted) {
+      await ctx.reply('Stopped.');
+    } else {
+      await ctx.reply('Nothing running.');
     }
   });
 
@@ -493,7 +636,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/memory', '/forget', '/chatid', '/wa', '/slack']);
+  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/model', '/abort', '/memory', '/forget', '/chatid', '/wa', '/slack']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();

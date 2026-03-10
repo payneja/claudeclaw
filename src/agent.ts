@@ -19,12 +19,19 @@ export interface UsageInfo {
    * context window size (cumulative overcounts on multi-step tool-use turns).
    */
   lastCallCacheRead: number;
+  /**
+   * The input_tokens from the LAST API call in the turn.
+   * This is the actual context window size: system prompt + conversation
+   * history + tool results for that call. Use this for context warnings.
+   */
+  lastCallInputTokens: number;
 }
 
 export interface AgentResult {
   text: string | null;
   newSessionId: string | undefined;
   usage: UsageInfo | null;
+  aborted?: boolean;
 }
 
 /**
@@ -58,14 +65,18 @@ async function* singleTurn(text: string): AsyncGenerator<{
  * No explicit token needed if you're already logged in via `claude login`.
  * Optionally override with CLAUDE_CODE_OAUTH_TOKEN in .env.
  *
- * @param message   The user's text (may include transcribed voice prefix)
- * @param sessionId Claude Code session ID to resume, or undefined for new session
- * @param onTyping  Called every TYPING_REFRESH_MS while waiting — sends typing action to Telegram
+ * @param message         The user's text (may include transcribed voice prefix)
+ * @param sessionId       Claude Code session ID to resume, or undefined for new session
+ * @param onTyping        Called every TYPING_REFRESH_MS while waiting — sends typing action to Telegram
+ * @param model           Optional model override (e.g. 'sonnet', 'haiku', 'opus')
+ * @param abortController Optional AbortController to cancel the query mid-flight
  */
 export async function runAgent(
   message: string,
   sessionId: string | undefined,
   onTyping: () => void,
+  model?: string,
+  abortController?: AbortController,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -86,6 +97,7 @@ export async function runAgent(
   let didCompact = false;
   let preCompactTokens: number | null = null;
   let lastCallCacheRead = 0;
+  let lastCallInputTokens = 0;
 
   // Refresh typing indicator on an interval while Claude works.
   // Telegram's "typing..." action expires after ~5s.
@@ -100,8 +112,8 @@ export async function runAgent(
     for await (const event of query({
       prompt: singleTurn(message),
       options: {
-        // Use Sonnet 4.6 (Tier 2 doesn't have access to Opus 1M variants)
-        model: 'sonnet',
+        // Default to Sonnet (Tier 2 API). Override via /model command.
+        model: model ?? 'sonnet',
 
         // cwd = claudeclaw project root so Claude Code loads our CLAUDE.md
         cwd: PROJECT_ROOT,
@@ -118,6 +130,9 @@ export async function runAgent(
 
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,
+
+        // Abort support — signals the SDK to kill the subprocess
+        ...(abortController ? { abortController } : {}),
       },
     })) {
       const ev = event as Record<string, unknown>;
@@ -138,14 +153,18 @@ export async function runAgent(
         );
       }
 
-      // Track per-call cache reads from assistant message events.
+      // Track per-call token usage from assistant message events.
       // Each assistant message represents one API call; its usage reflects
       // that single call's context size (not cumulative across the turn).
       if (ev['type'] === 'assistant') {
         const msgUsage = (ev['message'] as Record<string, unknown>)?.['usage'] as Record<string, number> | undefined;
         const callCacheRead = msgUsage?.['cache_read_input_tokens'] ?? 0;
+        const callInputTokens = msgUsage?.['input_tokens'] ?? 0;
         if (callCacheRead > 0) {
           lastCallCacheRead = callCacheRead;
+        }
+        if (callInputTokens > 0) {
+          lastCallInputTokens = callInputTokens;
         }
       }
 
@@ -163,12 +182,14 @@ export async function runAgent(
             didCompact,
             preCompactTokens,
             lastCallCacheRead,
+            lastCallInputTokens,
           };
           logger.info(
             {
               inputTokens: usage.inputTokens,
               cacheReadTokens: usage.cacheReadInputTokens,
               lastCallCacheRead: usage.lastCallCacheRead,
+              lastCallInputTokens: usage.lastCallInputTokens,
               costUsd: usage.totalCostUsd,
               didCompact,
             },
@@ -182,6 +203,12 @@ export async function runAgent(
         );
       }
     }
+  } catch (err) {
+    if (abortController?.signal.aborted) {
+      logger.info('Agent query aborted by user');
+      return { text: null, newSessionId, usage, aborted: true };
+    }
+    throw err;
   } finally {
     clearInterval(typingInterval);
   }

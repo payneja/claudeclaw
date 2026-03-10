@@ -130,12 +130,25 @@ function createSchema(database: Database.Database): void {
   `);
 }
 
+/**
+ * Run incremental schema migrations for existing databases.
+ * Each migration checks before applying, so this is safe to call on every startup.
+ */
+function runMigrations(database: Database.Database): void {
+  const cols = database.pragma('table_info(token_usage)') as Array<{ name: string }>;
+  const hasContextTokens = cols.some(c => c.name === 'context_tokens');
+  if (!hasContextTokens) {
+    database.exec('ALTER TABLE token_usage ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0');
+  }
+}
+
 export function initDatabase(): void {
   fs.mkdirSync(STORE_DIR, { recursive: true });
   const dbPath = path.join(STORE_DIR, 'claudeclaw.db');
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   createSchema(db);
+  runMigrations(db);
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -484,14 +497,15 @@ export function saveTokenUsage(
   inputTokens: number,
   outputTokens: number,
   cacheRead: number,
+  contextTokens: number,
   costUsd: number,
   didCompact: boolean,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, cost_usd, did_compact, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, costUsd, didCompact ? 1 : 0, now);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now);
 }
 
 export interface SessionTokenSummary {
