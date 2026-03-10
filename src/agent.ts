@@ -100,6 +100,9 @@ export async function runAgent(
     for await (const event of query({
       prompt: singleTurn(message),
       options: {
+        // Use Sonnet 4.6 (Tier 2 doesn't have access to Opus 1M variants)
+        model: 'sonnet',
+
         // cwd = claudeclaw project root so Claude Code loads our CLAUDE.md
         cwd: PROJECT_ROOT,
 

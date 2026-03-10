@@ -328,7 +328,14 @@ export function createBot(): Bot {
     throw new Error('TELEGRAM_BOT_TOKEN is not set in .env');
   }
 
-  const bot = new Bot(TELEGRAM_BOT_TOKEN);
+  const bot = new Bot(TELEGRAM_BOT_TOKEN, {
+    client: {
+      // Default is 500s. With a 30s server-side polling timeout, any single
+      // API call should complete within ~35s. 60s gives generous headroom
+      // while catching stale TCP connections that hang indefinitely.
+      timeoutSeconds: 60,
+    },
+  });
 
   // /chatid — get the chat ID (used during first-time setup)
   // Responds to anyone only when ALLOWED_CHAT_ID is not yet configured.
