@@ -12,14 +12,14 @@ last-worked: 2026-03-09
 ## Status
 - **State:** Maintenance
 - **Domain:** productivity
-- **Last Worked:** 2026-03-09 (upstream review, rollback, stability audit)
-- **Current Focus:** Running in production. Reviewed upstream's 30-commit multi-agent overhaul, decided to cherry-pick selectively rather than pull everything. Rolled back to 736571f. Established upstream review protocol. Identified future additions: /model, /abort, file markers, TTS, multi-agent (research + health bots on Haiku).
+- **Last Worked:** 2026-03-09 (upstream cherry-pick, DF migration planning, documentation)
+- **Current Focus:** Running in production with cherry-picked features (/model, /abort, file markers, baseline context tracking). Reviewed Data Foundation and Cortex architecture for integration path. Documented 5-phase SQLite+Postgres migration plan and upstream review process. Next milestone: health bot prototype as first domain-specific agent.
 
 ## One-Liner
 Telegram bot for mobile Cortex access, push alerts, and quick capture from iPhone.
 
 ## Next Action
-Commit local customizations as first save point. Then cherry-pick upstream features: /model command, abort mechanism (as /abort), file sending markers, TTS cascade (Groq Orpheus primary). Set up research and health Telegram bots on Haiku.
+Create a health-domain Telegram bot (Haiku model) as a prototype for domain-specific agents. This bot would load Health project context and let Jason query health data, Function Health results, and fitness logs from his phone. Design it to coordinate through cortex-mcp (Data Foundation) when DF is operational, not through upstream's SQLite Hive Mind.
 
 ## Parent Project
 Cortex (subproject). Built during CortexRestructure Domain 5 implementation.
@@ -52,3 +52,8 @@ Cortex (subproject). Built during CortexRestructure Domain 5 implementation.
 - [x] Polling fix: timeoutSeconds 500->60, ProcessType Interactive, DEBUG=grammy:error (2026-03-01)
 - [x] Reviewed upstream 30-commit multi-agent overhaul, rolled back, established cherry-pick protocol (2026-03-09)
 - [x] Confirmed all known stability issues (polling, auth bypass, context >100%) already fixed (2026-03-09)
+- [x] First Jason commit: save point for local customizations at 9d4de27 (2026-03-09)
+- [x] Cherry-picked 4 upstream features: /model, /abort, file markers, context tracking (2026-03-09)
+- [x] Analyzed Data Foundation + Cortex architecture for ClaudeClaw integration (2026-03-09)
+- [x] Documented upstream review process and 5-phase DF migration plan (2026-03-09)
+- [x] Service restarted with new features, verified clean startup (2026-03-09)
