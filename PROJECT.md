@@ -37,9 +37,10 @@ Cortex (subproject). Built during CortexRestructure Domain 5 implementation.
 - [x] Telegram bot with Claude access from iPhone
 - [x] Security: ALLOWED_CHAT_ID, dedicated API key
 - [x] Push alerts via notify.sh (watchdog integration)
-- [ ] Voice input via Groq Whisper
+- [ ] Voice input via Groq Whisper (add Groq API key -- relocated from CortexRestructure)
 - [ ] Voice replies
 - [ ] Slack integration
+- [ ] Evaluate Goldbach's launchd + tmux + cron skill pattern against current Telegram bot architecture (relocated from CortexRestructure)
 
 ## Progress
 - [x] Cloned, built, CLAUDE.md customized (2026-02-28)

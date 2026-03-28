@@ -47,6 +47,12 @@ export const CONTEXT_LIMIT = parseInt(
   10,
 );
 
+// Health domain — iCloud project root
+export const HEALTH_PROJECT_ROOT = path.join(
+  process.env.HOME || '',
+  'Library/Mobile Documents/com~apple~CloudDocs/Projects/Health',
+);
+
 // Telegram limits
 export const MAX_MESSAGE_LENGTH = 4096;
 

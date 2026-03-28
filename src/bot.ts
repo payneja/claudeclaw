@@ -5,6 +5,7 @@ import { runAgent, UsageInfo } from './agent.js';
 import {
   ALLOWED_CHAT_ID,
   CONTEXT_LIMIT,
+  HEALTH_PROJECT_ROOT,
   MAX_MESSAGE_LENGTH,
   TELEGRAM_BOT_TOKEN,
   TYPING_REFRESH_MS,
@@ -77,6 +78,51 @@ const chatModelOverride = new Map<string, string>();
 
 const AVAILABLE_MODELS = ['opus', 'sonnet', 'haiku'] as const;
 const DEFAULT_MODEL_LABEL = 'sonnet';
+
+// ── Domain mode ──────────────────────────────────────────────────────
+// Switches between cortex (general assistant) and health (health data) modes.
+// Each domain has its own default model and context preamble.
+type DomainMode = 'cortex' | 'health';
+const chatDomainMode = new Map<string, DomainMode>();
+
+const DOMAIN_DEFAULTS: Record<DomainMode, { model: string; label: string }> = {
+  cortex: { model: 'sonnet', label: 'Cortex (Sonnet)' },
+  health: { model: 'haiku', label: 'Health (Haiku)' },
+};
+
+function getHealthPreamble(): string {
+  return `[HEALTH MODE]
+You are Jason's health assistant. Direct, no-nonsense. Same personality rules as always.
+
+Primary data directory: ${HEALTH_PROJECT_ROOT}
+
+Key folders:
+- Current-Profile/ -- active protocols, DNA profile, supplements, training program
+- Labs/ -- blood work, clinical panels, lab results
+- DNA-Genetics/ -- 23andMe, DNAFit, Promethease genetic data
+- Biomarkers/ -- DEXA, GI testing, body composition
+- Oncology/ -- bone marrow biopsy, hematology, COMPASS genomic panel
+- Wearable-Data/ -- Oura Ring exports, Apple Health exports
+- Training/ -- workout programs, physical therapy
+- Nutrition/ -- meal plans, supplement inventory
+- VA-Disability/ -- VA documentation, DBQs, ratings
+- Military-Medical-Records/ -- Air Force service medical records
+- LLM-Profiles/ -- AI-generated health analyses
+- Genetic-Analysis/ -- pipeline-generated genetic reports
+
+On your FIRST message in a new session, read these baseline files:
+1. ${HEALTH_PROJECT_ROOT}/Current-Profile/Personal Profile.md
+2. ${HEALTH_PROJECT_ROOT}/Current-Profile/DNA Profile.md
+3. ${HEALTH_PROJECT_ROOT}/Current-Profile/Supplements.md
+4. ${HEALTH_PROJECT_ROOT}/Current-Profile/Training Program.md
+
+You can read and write all files in the Health project. For lab trends, parse XLSX/CSV files. For clinical records, read PDFs. Use glob and grep to search across the full project when needed.
+
+ClaudeClaw infrastructure is still available at absolute paths:
+- Scheduler: node /Users/jasonpayne/Developer/projects/claudeclaw/dist/schedule-cli.js
+- Notify: /Users/jasonpayne/Developer/projects/claudeclaw/scripts/notify.sh
+[END HEALTH MODE]`;
+}
 
 // ── File sending markers ─────────────────────────────────────────────
 
@@ -294,9 +340,16 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     'Processing message',
   );
 
-  // Build memory context and prepend to message
+  // Build memory context and domain preamble
   const memCtx = await buildMemoryContext(chatIdStr, message);
-  const fullMessage = memCtx ? `${memCtx}\n\n${message}` : message;
+  const domain = chatDomainMode.get(chatIdStr) ?? 'cortex';
+  const domainPreamble = domain === 'health' ? getHealthPreamble() : null;
+
+  const parts: string[] = [];
+  if (domainPreamble) parts.push(domainPreamble);
+  if (memCtx) parts.push(memCtx);
+  parts.push(message);
+  const fullMessage = parts.join('\n\n');
 
   const sessionId = getSession(chatIdStr);
 
@@ -311,11 +364,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   setActiveAbort(chatIdStr, abortCtrl);
 
   try {
+    // Model priority: explicit /model override > domain default > sonnet
+    const domainDefaults = DOMAIN_DEFAULTS[domain];
+    const model = chatModelOverride.get(chatIdStr) ?? domainDefaults.model;
+
     const result = await runAgent(
       fullMessage,
       sessionId,
       () => void sendTyping(ctx.api, chatId),
-      chatModelOverride.get(chatIdStr),
+      model,
       abortCtrl,
     );
 
@@ -372,7 +429,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       if (shouldSpeakBack) {
         try {
           const audioBuffer = await synthesizeSpeech(responseText);
-          await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.mp3'));
+          await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
         } catch (ttsErr) {
           logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
           for (const part of splitMessage(formatForTelegram(responseText))) {
@@ -534,6 +591,30 @@ export function createBot(): Bot {
     await ctx.reply(`Model changed: ${arg}`);
   });
 
+  // /health — switch to health domain mode
+  bot.command('health', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    chatDomainMode.set(chatIdStr, 'health');
+    chatModelOverride.delete(chatIdStr); // reset to domain default
+    clearSession(chatIdStr);
+    sessionBaseline.delete(chatIdStr);
+    await ctx.reply('Health mode. Haiku active. Session cleared.\nAsk me anything about your health data.');
+    logger.info({ chatId: ctx.chat!.id }, 'Switched to health domain');
+  });
+
+  // /cortex — switch back to default domain mode
+  bot.command('cortex', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    chatDomainMode.delete(chatIdStr);
+    chatModelOverride.delete(chatIdStr);
+    clearSession(chatIdStr);
+    sessionBaseline.delete(chatIdStr);
+    await ctx.reply('Cortex mode. Sonnet active. Session cleared.');
+    logger.info({ chatId: ctx.chat!.id }, 'Switched to cortex domain');
+  });
+
   // /abort — cancel the active query
   bot.command('abort', async (ctx) => {
     if (!isAuthorised(ctx.chat!.id)) return;
@@ -636,7 +717,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/model', '/abort', '/memory', '/forget', '/chatid', '/wa', '/slack']);
+  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/model', '/abort', '/memory', '/forget', '/chatid', '/wa', '/slack', '/health', '/cortex']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();

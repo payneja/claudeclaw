@@ -2,9 +2,11 @@ import fs, { mkdirSync } from 'fs';
 import https from 'https';
 import path from 'path';
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 import { readEnvFile } from './env.js';
+import { logger } from './logger.js';
 
 // ── Upload directory ────────────────────────────────────────────────────────
 
@@ -203,34 +205,158 @@ export async function transcribeAudio(filePath: string): Promise<string> {
   return response.text ?? '';
 }
 
-// ── TTS: ElevenLabs ─────────────────────────────────────────────────────────
+// ── TTS: Groq Orpheus ───────────────────────────────────────────────────────
+
+const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english';
+const GROQ_TTS_VOICE = 'daniel';
+const GROQ_TTS_MAX_CHARS = 200;
+const WAV_HEADER_SIZE = 44;
 
 /**
- * Convert text to speech using ElevenLabs and return the audio as a Buffer.
- * Uses the voice ID from ELEVENLABS_VOICE_ID in .env.
+ * Split text into chunks that fit within Groq's 200-char limit.
+ * Splits on sentence boundaries, then commas, then spaces.
  */
-export async function synthesizeSpeech(text: string): Promise<Buffer> {
+export function chunkTextForTTS(text: string, maxLen: number = GROQ_TTS_MAX_CHARS): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+
+    const segment = remaining.slice(0, maxLen);
+    let splitAt = -1;
+
+    for (const sep of ['. ', '! ', '? ', '.\n', '!\n', '?\n']) {
+      const idx = segment.lastIndexOf(sep);
+      if (idx > maxLen / 2) {
+        splitAt = idx + sep.length;
+        break;
+      }
+    }
+
+    if (splitAt === -1) {
+      const commaIdx = segment.lastIndexOf(', ');
+      if (commaIdx > maxLen / 2) splitAt = commaIdx + 2;
+    }
+
+    if (splitAt === -1) {
+      const spaceIdx = segment.lastIndexOf(' ');
+      if (spaceIdx > maxLen / 2) splitAt = spaceIdx + 1;
+    }
+
+    if (splitAt === -1) splitAt = maxLen;
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  return chunks.filter(c => c.length > 0);
+}
+
+/**
+ * Concatenate multiple WAV buffers into one.
+ * Assumes all WAVs share the same format (sample rate, channels, bit depth).
+ */
+function concatenateWavBuffers(buffers: Buffer[]): Buffer {
+  if (buffers.length === 0) throw new Error('No audio buffers to concatenate');
+  if (buffers.length === 1) return buffers[0];
+
+  const pcmChunks = buffers.map(buf => buf.subarray(WAV_HEADER_SIZE));
+  const totalPcmSize = pcmChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+
+  const header = Buffer.from(buffers[0].subarray(0, WAV_HEADER_SIZE));
+  header.writeUInt32LE(totalPcmSize + 36, 4);  // RIFF chunk size
+  header.writeUInt32LE(totalPcmSize, 40);       // data sub-chunk size
+
+  return Buffer.concat([header, ...pcmChunks]);
+}
+
+/**
+ * Convert WAV buffer to OGG Opus via ffmpeg (required for Telegram voice messages).
+ */
+function wavToOgg(wavBuffer: Buffer): Buffer {
+  const id = `tts_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const tmpWav = path.join(UPLOADS_DIR, `${id}.wav`);
+  const tmpOgg = path.join(UPLOADS_DIR, `${id}.ogg`);
+
+  try {
+    fs.writeFileSync(tmpWav, wavBuffer);
+    execFileSync('ffmpeg', [
+      '-i', tmpWav,
+      '-c:a', 'libopus',
+      '-b:a', '64k',
+      '-y',
+      tmpOgg,
+    ], { timeout: 15000, stdio: 'pipe' });
+    return fs.readFileSync(tmpOgg);
+  } finally {
+    if (fs.existsSync(tmpWav)) fs.unlinkSync(tmpWav);
+    if (fs.existsSync(tmpOgg)) fs.unlinkSync(tmpOgg);
+  }
+}
+
+/**
+ * Convert text to speech using Groq Orpheus.
+ * Chunks long text, runs parallel API calls, concatenates WAV, converts to OGG.
+ */
+async function synthesizeSpeechGroq(text: string): Promise<Buffer> {
+  const env = readEnvFile(['GROQ_API_KEY']);
+  const apiKey = env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY not set in .env');
+
+  const chunks = chunkTextForTTS(text);
+  logger.info({ chunks: chunks.length, totalChars: text.length }, 'Groq TTS: synthesizing');
+
+  const wavBuffers = await Promise.all(
+    chunks.map(async (chunk) => {
+      const payload = JSON.stringify({
+        model: GROQ_TTS_MODEL,
+        input: chunk,
+        voice: GROQ_TTS_VOICE,
+        response_format: 'wav',
+      });
+
+      return httpsRequest(
+        'https://api.groq.com/openai/v1/audio/speech',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload).toString(),
+          },
+        },
+        payload,
+      );
+    }),
+  );
+
+  const combinedWav = concatenateWavBuffers(wavBuffers);
+  return wavToOgg(combinedWav);
+}
+
+// ── TTS: ElevenLabs (fallback) ──────────────────────────────────────────────
+
+async function synthesizeSpeechElevenLabs(text: string): Promise<Buffer> {
   const env = readEnvFile(['ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID']);
   const apiKey = env.ELEVENLABS_API_KEY;
   const voiceId = env.ELEVENLABS_VOICE_ID;
 
-  if (!apiKey) {
-    throw new Error('ELEVENLABS_API_KEY not set in .env');
-  }
-  if (!voiceId) {
-    throw new Error('ELEVENLABS_VOICE_ID not set in .env');
-  }
+  if (!apiKey) throw new Error('ELEVENLABS_API_KEY not set');
+  if (!voiceId) throw new Error('ELEVENLABS_VOICE_ID not set');
 
   const payload = JSON.stringify({
     text,
     model_id: 'eleven_turbo_v2_5',
-    voice_settings: {
-      stability: 0.5,
-      similarity_boost: 0.75,
-    },
+    voice_settings: { stability: 0.5, similarity_boost: 0.75 },
   });
 
-  const audioBuffer = await httpsRequest(
+  return httpsRequest(
     `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
     {
       method: 'POST',
@@ -243,8 +369,34 @@ export async function synthesizeSpeech(text: string): Promise<Buffer> {
     },
     payload,
   );
+}
 
-  return audioBuffer;
+// ── TTS cascade ─────────────────────────────────────────────────────────────
+
+/**
+ * Convert text to speech using the first available provider.
+ * Cascade: Groq Orpheus -> ElevenLabs
+ */
+export async function synthesizeSpeech(text: string): Promise<Buffer> {
+  const env = readEnvFile([
+    'GROQ_API_KEY',
+    'ELEVENLABS_API_KEY',
+    'ELEVENLABS_VOICE_ID',
+  ]);
+
+  if (env.GROQ_API_KEY) {
+    try {
+      return await synthesizeSpeechGroq(text);
+    } catch (err) {
+      logger.warn({ err }, 'Groq TTS failed, trying fallback');
+    }
+  }
+
+  if (env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID) {
+    return synthesizeSpeechElevenLabs(text);
+  }
+
+  throw new Error('No TTS provider configured. Set GROQ_API_KEY or ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID in .env');
 }
 
 // ── Capabilities check ──────────────────────────────────────────────────────
@@ -261,6 +413,9 @@ export function voiceCapabilities(): { stt: boolean; tts: boolean } {
 
   return {
     stt: !!env.GROQ_API_KEY,
-    tts: !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID),
+    tts: !!(
+      env.GROQ_API_KEY ||
+      (env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID)
+    ),
   };
 }

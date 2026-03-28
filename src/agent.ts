@@ -70,6 +70,7 @@ async function* singleTurn(text: string): AsyncGenerator<{
  * @param onTyping        Called every TYPING_REFRESH_MS while waiting — sends typing action to Telegram
  * @param model           Optional model override (e.g. 'sonnet', 'haiku', 'opus')
  * @param abortController Optional AbortController to cancel the query mid-flight
+ * @param cwd             Optional working directory override (default: PROJECT_ROOT)
  */
 export async function runAgent(
   message: string,
@@ -77,6 +78,7 @@ export async function runAgent(
   onTyping: () => void,
   model?: string,
   abortController?: AbortController,
+  cwd?: string,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -115,8 +117,8 @@ export async function runAgent(
         // Default to Sonnet (Tier 2 API). Override via /model command.
         model: model ?? 'sonnet',
 
-        // cwd = claudeclaw project root so Claude Code loads our CLAUDE.md
-        cwd: PROJECT_ROOT,
+        // cwd determines which CLAUDE.md gets loaded via settingSources
+        cwd: cwd ?? PROJECT_ROOT,
 
         // Resume the previous session for this chat (persistent context)
         resume: sessionId,
